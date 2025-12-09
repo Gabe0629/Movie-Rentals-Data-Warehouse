@@ -1,0 +1,187 @@
+-- ============================================
+-- WEEK 5: DATA QUALITY CHECKS
+-- ============================================
+
+-- 1. Check for NULL dates in fact table
+SELECT 
+    'rentals_with_null_dates' as check_name,
+    COUNT(*) as issue_count,
+    'Critical: NULL dates affect time-based analysis' as description
+FROM rentals
+WHERE date_id IS NULL OR rental_date IS NULL;
+
+-- 2. Check for invalid fees
+SELECT 
+    'invalid_fees' as check_name,
+    COUNT(*) as issue_count,
+    'Critical: Rental fees must be positive, late fees non-negative' as description
+FROM rentals
+WHERE rental_fee <= 0 OR late_fee < 0;
+
+-- 3. Check for return_date < rental_date
+SELECT 
+    'invalid_return_dates' as check_name,
+    COUNT(*) as issue_count,
+    'Critical: Return date cannot be before rental date' as description
+FROM rentals
+WHERE return_date IS NOT NULL AND return_date < rental_date;
+
+-- 4. Check for orphaned foreign keys
+SELECT 
+    'orphaned_movie_ids_in_rentals' as check_name,
+    COUNT(DISTINCT r.movie_id) as issue_count,
+    'Critical: Movies referenced in rentals must exist in movies table' as description
+FROM rentals r
+LEFT JOIN movies m ON r.movie_id = m.movie_id
+WHERE m.movie_id IS NULL;
+
+SELECT 
+    'orphaned_customer_ids_in_rentals' as check_name,
+    COUNT(DISTINCT r.customer_id) as issue_count,
+    'Critical: Customers referenced in rentals must exist' as description
+FROM rentals r
+LEFT JOIN customers c ON r.customer_id = c.customer_id
+WHERE c.customer_id IS NULL;
+
+-- 5. Check for duplicate customer emails
+SELECT 
+    'duplicate_customer_emails' as check_name,
+    COUNT(*) as issue_count,
+    'Warning: Email addresses should be unique per customer' as description
+FROM (
+    SELECT email, COUNT(*)
+    FROM customers
+    WHERE email IS NOT NULL AND email != ''
+    GROUP BY email
+    HAVING COUNT(*) > 1
+);
+
+-- 6. Check for movies without any rentals
+SELECT 
+    'movies_never_rented' as check_name,
+    COUNT(*) as issue_count,
+    'Info: Movies with no rental history' as description
+FROM movies m
+LEFT JOIN rentals r ON m.movie_id = r.movie_id
+WHERE r.rental_id IS NULL;
+
+-- 7. Check date dimension coverage gaps
+WITH rental_dates AS (
+    SELECT DISTINCT DATE(rental_date) as rental_day
+    FROM rentals
+    WHERE rental_date IS NOT NULL
+),
+missing_dates AS (
+    SELECT rd.rental_day
+    FROM rental_dates rd
+    LEFT JOIN dates d ON rd.rental_day = d.full_date
+    WHERE d.date_id IS NULL
+)
+SELECT 
+    'missing_dates_in_dimension' as check_name,
+    COUNT(*) as issue_count,
+    'Critical: All rental dates should exist in dates dimension' as description
+FROM missing_dates;
+
+-- 8. Check for overlapping rentals (same customer, same movie, overlapping dates)
+WITH overlapping_rentals AS (
+    SELECT 
+        r1.rental_id as rental1,
+        r2.rental_id as rental2,
+        r1.customer_id,
+        r1.movie_id
+    FROM rentals r1
+    JOIN rentals r2 ON r1.customer_id = r2.customer_id 
+        AND r1.movie_id = r2.movie_id
+        AND r1.rental_id < r2.rental_id
+    WHERE r1.return_date IS NOT NULL 
+        AND r2.return_date IS NOT NULL
+        AND (
+            (r2.rental_date BETWEEN r1.rental_date AND r1.return_date) OR
+            (r1.rental_date BETWEEN r2.rental_date AND r2.return_date)
+        )
+)
+SELECT 
+    'overlapping_rentals' as check_name,
+    COUNT(DISTINCT rental1) as issue_count,
+    'Warning: Same customer renting same movie with overlapping dates' as description
+FROM overlapping_rentals;
+
+-- 9. Check customer join dates vs first rental dates
+WITH customer_anomalies AS (
+    SELECT 
+        c.customer_id,
+        c.join_date,
+        MIN(r.rental_date) as first_rental_date
+    FROM customers c
+    LEFT JOIN rentals r ON c.customer_id = r.customer_id
+    GROUP BY c.customer_id, c.join_date
+    HAVING first_rental_date < join_date
+)
+SELECT 
+    'rentals_before_join_date' as check_name,
+    COUNT(*) as issue_count,
+    'Critical: Customers cannot rent before joining' as description
+FROM customer_anomalies;
+
+-- 10. Data Quality Summary Report
+SELECT 
+    check_name,
+    issue_count,
+    CASE 
+        WHEN issue_count = 0 THEN '✅ PASS'
+        ELSE '❌ FAIL'
+    END as status,
+    description
+FROM (
+    -- Compile all checks
+    SELECT 'rentals_with_null_dates' as check_name, COUNT(*) as issue_count,
+           'Critical: NULL dates affect time-based analysis' as description
+    FROM rentals WHERE date_id IS NULL OR rental_date IS NULL
+    
+    UNION ALL
+    
+    SELECT 'invalid_fees', COUNT(*), 'Critical: Rental fees must be positive, late fees non-negative'
+    FROM rentals WHERE rental_fee <= 0 OR late_fee < 0
+    
+    UNION ALL
+    
+    SELECT 'invalid_return_dates', COUNT(*), 'Critical: Return date cannot be before rental date'
+    FROM rentals WHERE return_date IS NOT NULL AND return_date < rental_date
+    
+    UNION ALL
+    
+    SELECT 'orphaned_movie_ids_in_rentals', COUNT(DISTINCT r.movie_id), 
+           'Critical: Movies referenced in rentals must exist in movies table'
+    FROM rentals r LEFT JOIN movies m ON r.movie_id = m.movie_id WHERE m.movie_id IS NULL
+    
+    UNION ALL
+    
+    SELECT 'orphaned_customer_ids_in_rentals', COUNT(DISTINCT r.customer_id),
+           'Critical: Customers referenced in rentals must exist'
+    FROM rentals r LEFT JOIN customers c ON r.customer_id = c.customer_id WHERE c.customer_id IS NULL
+    
+    UNION ALL
+    
+    SELECT 'movies_never_rented', COUNT(*), 'Info: Movies with no rental history'
+    FROM movies m LEFT JOIN rentals r ON m.movie_id = r.movie_id WHERE r.rental_id IS NULL
+    
+    UNION ALL
+    
+    SELECT 'rentals_before_join_date', COUNT(*), 'Critical: Customers cannot rent before joining'
+    FROM (
+        SELECT c.customer_id
+        FROM customers c
+        JOIN rentals r ON c.customer_id = r.customer_id
+        WHERE r.rental_date < c.join_date
+        GROUP BY c.customer_id
+    )
+)
+ORDER BY 
+    CASE 
+        WHEN description LIKE 'Critical:%' THEN 1
+        WHEN description LIKE 'Warning:%' THEN 2
+        ELSE 3
+    END,
+    issue_count DESC;
+    
